@@ -21,13 +21,13 @@ const SEG_LENGTH = 80;            // z-length of one road segment
 const SEG_COUNT = 8;              // total segments alive at once
 // Total road z-coverage: SEG_LENGTH * SEG_COUNT = 640
 
-// Obstacle spawning (reduced 20% from original)
-const MIN_OBSTACLE_GAP = 45;      // min z-distance between consecutive obstacle rows
+// Obstacle spawning — wider gaps for breathing room
+const MIN_OBSTACLE_GAP = 60;      // min z-distance between consecutive obstacle rows
 const MAX_LANES_BLOCKED = 2;      // at most 2 of 3 lanes blocked at once (always 1 free)
 
 // Road events
 type RoadEvent = "normal" | "speed_boost" | "construction" | "overpass" | "coin_streak";
-const ROAD_EVENT_CHANCE = 0.35;   // 35% chance a recycled segment gets an event
+const ROAD_EVENT_CHANCE = 0.50;   // 50% chance a recycled segment gets an event
 
 // Car physics
 const CAR_LANE_SPEED = 0.12;      // how fast car switches lanes (units per frame)
@@ -45,9 +45,10 @@ interface GameGroup extends THREE.Group {
 
 interface EnhancedCarRaceGameProps {
   username: string;
+  selectedCarColor?: number;
 }
 
-const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) => {
+const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, selectedCarColor }) => {
   // ── Refs ──
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -77,6 +78,8 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
 
   // Last z where an obstacle row was spawned — ensures minimum gap
   const lastObstacleZRef = useRef(0);
+  // Cumulative distance traveled (for spawning logic, car stays at z=0)
+  const distanceTraveledRef = useRef(0);
 
   // Road event objects (attached to segments, cleaned up on recycle)
   const roadEventObjectsRef = useRef<Map<number, THREE.Group[]>>(new Map());
@@ -86,9 +89,9 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
   const coinStreakRef = useRef<{ mesh: THREE.Mesh; segIdx: number }[]>([]);
 
   const gameStateRef = useRef({
-    baseGameSpeed: 0.008,
-    speedMultiplier: 1.0,
-    obstacleSpawnRate: 0.01,
+    baseGameSpeed: 0.005,
+    speedMultiplier: 0.7,
+    obstacleSpawnRate: 0.008,
     nextBonusThreshold: 70,
     gameStartTime: Date.now(),
     nextKeySpawnTime: 20,
@@ -96,7 +99,11 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     isInvisible: false,
     invisibilityTimer: 0,
     currentScore: 0,
-    maxSpeed: 2.5,
+    maxSpeed: 1.6,
+    coinsCollected: 0,
+    lives: 3,
+    respawnInvincible: false,
+    respawnTimer: 0,
   });
 
   const gameStatsRef = useRef({
@@ -109,6 +116,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
   });
 
   const gameRunningRef = useRef(false);
+  const lastFrameTimeRef = useRef(0);
 
   // Shared geometry / material refs (created once in init)
   const sharedRef = useRef<{
@@ -128,6 +136,10 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
   const [invisibilityCountdown, setInvisibilityCountdown] = useState(0);
   const [popup, setPopup] = useState<string | null>(null);
   const [speedBoostActive, setSpeedBoostActive] = useState(false);
+  const speedBoostActiveRef = useRef(false);
+  const [coins, setCoins] = useState(0);
+  const [lives, setLives] = useState(3);
+  const [currentLane, setCurrentLane] = useState(1);
 
   // ── Load high score ──
   useEffect(() => {
@@ -298,8 +310,8 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       const { mats } = sharedRef.current;
       const eventObjs: THREE.Group[] = [];
 
-      // Pick a random event
-      const events: RoadEvent[] = ["speed_boost", "construction", "overpass", "coin_streak"];
+      // Pick a random event — coin_streak weighted higher for more coin visibility
+      const events: RoadEvent[] = ["speed_boost", "construction", "overpass", "coin_streak", "coin_streak", "coin_streak"];
       const event = events[Math.floor(Math.random() * events.length)];
 
       if (event === "speed_boost") {
@@ -420,24 +432,43 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
         scene.add(overGroup);
         eventObjs.push(overGroup);
       } else if (event === "coin_streak") {
-        // Line of floating coins down one lane
+        // Line of floating coins down one lane — big & glowing like Subway Surfers
         const coinLane = LANE_CENTERS[Math.floor(Math.random() * LANE_COUNT)];
         const coinMat = new THREE.MeshStandardMaterial({
           color: 0xffd700,
-          metalness: 0.9,
-          roughness: 0.1,
-          emissive: new THREE.Color(0xffaa00),
-          emissiveIntensity: 0.5,
+          metalness: 1.0,
+          roughness: 0.05,
+          emissive: new THREE.Color(0xffcc00),
+          emissiveIntensity: 1.2,
         });
-        const coinGeo = new THREE.CylinderGeometry(0.35, 0.35, 0.08, 16);
+        const coinGeo = new THREE.CylinderGeometry(0.6, 0.6, 0.12, 20);
 
-        for (let z = -SEG_LENGTH / 2 + 5; z < SEG_LENGTH / 2 - 5; z += 4) {
+        // Glow ring around each coin
+        const glowMat = new THREE.MeshStandardMaterial({
+          color: 0xffee44,
+          emissive: new THREE.Color(0xffdd00),
+          emissiveIntensity: 1.5,
+          transparent: true,
+          opacity: 0.35,
+        });
+        const glowGeo = new THREE.RingGeometry(0.6, 1.0, 20);
+
+        for (let z = -SEG_LENGTH / 2 + 5; z < SEG_LENGTH / 2 - 5; z += 3.5) {
+          const coinGroup = new THREE.Group();
+
           const coin = new THREE.Mesh(coinGeo, coinMat);
-          coin.position.set(coinLane, 1.0, segZ + z);
           coin.rotation.x = Math.PI / 2;
           coin.castShadow = true;
-          scene.add(coin);
-          coinStreakRef.current.push({ mesh: coin, segIdx });
+          coinGroup.add(coin);
+
+          // Add glow ring
+          const glow = new THREE.Mesh(glowGeo, glowMat);
+          glow.rotation.x = Math.PI / 2;
+          coinGroup.add(glow);
+
+          coinGroup.position.set(coinLane, 1.2, segZ + z);
+          scene.add(coinGroup);
+          coinStreakRef.current.push({ mesh: coinGroup as unknown as THREE.Mesh, segIdx });
         }
       }
 
@@ -497,21 +528,46 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     goldenKeysRef.current.push(group);
   }, []);
 
-  // ── End game ──
-  const endGame = useCallback(() => {
+  // ── Lose a life / end game ──
+  const loseLife = useCallback(() => {
     if (!gameRunningRef.current || gameOver) return;
+    const gs = gameStateRef.current;
 
-    setGameRunning(false);
-    gameRunningRef.current = false;
-    setGameOver(true);
+    gs.lives -= 1;
+    setLives(gs.lives);
 
-    gameStatsRef.current.lapTime =
-      (Date.now() - gameStatsRef.current.gameStartTime) / 1000;
-    gameStatsRef.current.finalScore = gameStateRef.current.currentScore;
+    if (gs.lives <= 0) {
+      // Game over — no lives left
+      setGameRunning(false);
+      gameRunningRef.current = false;
+      setGameOver(true);
 
-    const isNew = saveHighScore(gameStatsRef.current.finalScore);
-    if (isNew) showPopup(`NEW HIGH SCORE! ${gameStatsRef.current.finalScore} pts!`);
+      gameStatsRef.current.lapTime =
+        (Date.now() - gameStatsRef.current.gameStartTime) / 1000;
+      gameStatsRef.current.finalScore = gs.currentScore;
+
+      const isNew = saveHighScore(gameStatsRef.current.finalScore);
+      if (isNew) showPopup(`NEW HIGH SCORE! ${gameStatsRef.current.finalScore} pts!`);
+    } else {
+      // Respawn with brief invincibility
+      gs.respawnInvincible = true;
+      gs.respawnTimer = 2500; // 2.5 seconds of invincibility after crash
+      showPopup(`CRASHED! ${gs.lives} ${gs.lives === 1 ? "life" : "lives"} left`);
+
+      // Flash car to indicate invincibility
+      if (carRef.current) {
+        carRef.current.traverse((child) => {
+          if ((child as THREE.Mesh).isMesh) {
+            const m = (child as THREE.Mesh).material as THREE.MeshStandardMaterial;
+            if (m) { m.transparent = true; m.opacity = 0.4; }
+          }
+        });
+      }
+    }
   }, [gameOver, saveHighScore, showPopup]);
+
+  // Keep endGame as alias for direct game-over (used nowhere now but kept for safety)
+  const endGame = loseLife;
 
   // ─────────────────────────────────────────────────────────
   // ANIMATION LOOP
@@ -532,7 +588,10 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     const camera = cameraRef.current;
     const renderer = rendererRef.current;
     const scene = sceneRef.current;
-    const time = Date.now() * 0.001;
+    const now = Date.now();
+    const time = now * 0.001;
+    const deltaMs = lastFrameTimeRef.current ? Math.min(now - lastFrameTimeRef.current, 50) : 16;
+    lastFrameTimeRef.current = now;
     const gs = gameStateRef.current;
 
     // ── Speed ──
@@ -544,19 +603,67 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     }
     const frameSpeed = gs.baseGameSpeed * gs.speedMultiplier; // units/frame factor
     const moveZ = frameSpeed * 30; // actual z-units the car moves this frame
-    setSpeed(gs.speedMultiplier);
+    // Only update React state when displayed value changes (1 decimal)
+    const roundedSpeed = Math.round(gs.speedMultiplier * 10) / 10;
+    setSpeed((prev) => (Math.round(prev * 10) / 10 === roundedSpeed ? prev : gs.speedMultiplier));
 
     // ── Invisibility ──
     if (gs.isInvisible) {
-      gs.invisibilityTimer -= 16;
+      gs.invisibilityTimer -= deltaMs;
       setInvisibilityCountdown(Math.max(0, Math.ceil(gs.invisibilityTimer / 1000)));
       if (invisibilityIndicatorRef.current)
         invisibilityIndicatorRef.current.rotation.y += 0.1;
       if (gs.invisibilityTimer <= 0) deactivateInvisibility();
     }
 
-    // ── Move car forward (negative z) ──
-    car.position.z -= moveZ;
+    // ── Respawn invincibility ──
+    if (gs.respawnInvincible) {
+      gs.respawnTimer -= deltaMs;
+      // Flash the car (blink effect)
+      if (carRef.current) {
+        const shouldShow = Math.floor(time * 10) % 2 === 0;
+        carRef.current.traverse((child) => {
+          if ((child as THREE.Mesh).isMesh) {
+            const m = (child as THREE.Mesh).material as THREE.MeshStandardMaterial;
+            if (m) { m.opacity = shouldShow ? 0.8 : 0.3; }
+          }
+        });
+      }
+      if (gs.respawnTimer <= 0) {
+        gs.respawnInvincible = false;
+        // Restore car opacity
+        if (carRef.current) {
+          carRef.current.traverse((child) => {
+            if ((child as THREE.Mesh).isMesh) {
+              const m = (child as THREE.Mesh).material as THREE.MeshStandardMaterial;
+              if (m) { m.transparent = false; m.opacity = 1.0; }
+            }
+          });
+        }
+      }
+    }
+
+    // ── Move world toward car (car stays at z=0) ──
+    distanceTraveledRef.current += moveZ;
+
+    // Move all world objects toward the car
+    obstaclesRef.current.forEach(obs => { obs.position.z += moveZ; });
+    bonusBoxesRef.current.forEach(box => { box.position.z += moveZ; });
+    goldenKeysRef.current.forEach(key => { key.position.z += moveZ; });
+
+    roadSegsRef.current.forEach((seg, idx) => {
+      seg.position.z += moveZ;
+      if (buildingGroupsRef.current[idx]) buildingGroupsRef.current[idx].position.z += moveZ;
+      if (treeGroupsRef.current[idx]) treeGroupsRef.current[idx].position.z += moveZ;
+    });
+
+    roadEventObjectsRef.current.forEach((objs) => {
+      objs.forEach(g => { g.position.z += moveZ; });
+    });
+
+    coinStreakRef.current.forEach(c => { c.mesh.position.z += moveZ; });
+
+    speedBoostZonesRef.current.forEach(zone => { zone.z += moveZ; });
 
     // ── Lane-based steering ──
     // Keyboard: switch target lane
@@ -574,6 +681,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       Math.min(ROAD_HALF - CAR_HALF_W, carXRef.current)
     );
     car.position.x = carXRef.current;
+    setCurrentLane(carLaneRef.current);
 
     // Slight car tilt when turning
     const tiltTarget = -dx * 0.06;
@@ -612,7 +720,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
 
     // ── Recycle road segments + spawn road events ──
     roadSegsRef.current.forEach((seg, idx) => {
-      if (seg.position.z > car.position.z + SEG_LENGTH) {
+      if (seg.position.z > SEG_LENGTH) {
         let minZ = Infinity;
         roadSegsRef.current.forEach((s) => {
           if (s.position.z < minZ) minZ = s.position.z;
@@ -642,11 +750,13 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     });
     if (inBoostZone) {
       gs.speedMultiplier = Math.min(gs.maxSpeed, gs.speedMultiplier + 0.04);
-      if (!speedBoostActive) {
+      if (!speedBoostActiveRef.current) {
+        speedBoostActiveRef.current = true;
         setSpeedBoostActive(true);
         showPopup("SPEED BOOST!");
       }
-    } else if (speedBoostActive) {
+    } else if (speedBoostActiveRef.current) {
+      speedBoostActiveRef.current = false;
       setSpeedBoostActive(false);
     }
 
@@ -654,18 +764,20 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     for (let i = coinStreakRef.current.length - 1; i >= 0; i--) {
       const coin = coinStreakRef.current[i];
       // Rotate coins
-      coin.mesh.rotation.z += 0.05;
-      // Bob coins
-      coin.mesh.position.y = 1.0 + Math.sin(time * 4 + i * 0.5) * 0.15;
+      coin.mesh.rotation.y += 0.08;
+      // Bob coins (higher amplitude)
+      coin.mesh.position.y = 1.2 + Math.sin(time * 5 + i * 0.4) * 0.25;
 
-      // Collect
+      // Collect (slightly larger pickup radius)
       const cdz = Math.abs(coin.mesh.position.z - car.position.z);
       const cdx = Math.abs(coin.mesh.position.x - car.position.x);
-      if (cdz < 1.5 && cdx < 1.2) {
+      if (cdz < 2.0 && cdx < 1.5) {
         scene.remove(coin.mesh);
         coinStreakRef.current.splice(i, 1);
         gs.currentScore += 10;
+        gs.coinsCollected += 1;
         setScore(gs.currentScore);
+        setCoins(gs.coinsCollected);
       }
     }
 
@@ -697,25 +809,25 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     });
 
     // ── Spawn obstacle rows ──
-    // We want obstacles to appear ahead of the car at regular intervals
-    const spawnAheadZ = car.position.z - 200; // spawn 200 units ahead
-    while (lastObstacleZRef.current > spawnAheadZ) {
-      lastObstacleZRef.current -= MIN_OBSTACLE_GAP;
+    // Spawn obstacles ahead based on cumulative distance traveled
+    const spawnHorizon = distanceTraveledRef.current + 350;
+    while (lastObstacleZRef.current < spawnHorizon) {
+      lastObstacleZRef.current += MIN_OBSTACLE_GAP;
       if (Math.random() < gs.obstacleSpawnRate * 5) {
-        createObstacleRow(lastObstacleZRef.current);
+        createObstacleRow(-(lastObstacleZRef.current - distanceTraveledRef.current));
       }
     }
 
     // ── Spawn bonuses at score thresholds ──
     if (gs.currentScore >= gs.nextBonusThreshold) {
-      createBonusBox(car.position.z - 150 - Math.random() * 50);
+      createBonusBox(-150 - Math.random() * 50);
       gs.nextBonusThreshold += 70;
     }
 
     // ── Spawn golden keys on timer ──
     const elapsed = (Date.now() - gs.gameStartTime) / 1000;
     if (elapsed >= gs.nextKeySpawnTime) {
-      createGoldenKey(car.position.z - 180 - Math.random() * 40);
+      createGoldenKey(-180 - Math.random() * 40);
       gs.nextKeySpawnTime += gs.keySpawnInterval;
     }
 
@@ -724,7 +836,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       const obs = obstaclesRef.current[i];
 
       // Passed behind car — remove and score
-      if (obs.position.z > car.position.z + 5) {
+      if (obs.position.z > 5) {
         scene.remove(obs);
         obstaclesRef.current.splice(i, 1);
         gs.currentScore += 5;
@@ -734,12 +846,18 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       }
 
       // Collision check (axis-aligned bounding box)
-      if (!gs.isInvisible) {
+      if (!gs.isInvisible && !gs.respawnInvincible) {
         const dz = Math.abs(obs.position.z - car.position.z);
         const dx = Math.abs(obs.position.x - car.position.x);
         if (dz < CAR_HALF_Z && dx < (CAR_HALF_W + 0.6)) {
           endGame();
-          return;
+          // Remove the obstacle that hit us
+          scene.remove(obs);
+          obstaclesRef.current.splice(i, 1);
+          // If game over (no lives left), stop the loop
+          if (!gameRunningRef.current) return;
+          // Otherwise lives remain — keep going (break out of obstacle loop only)
+          break;
         }
       }
     }
@@ -747,7 +865,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     // ── Collision — bonus boxes ──
     for (let i = bonusBoxesRef.current.length - 1; i >= 0; i--) {
       const box = bonusBoxesRef.current[i];
-      if (box.position.z > car.position.z + 8) {
+      if (box.position.z > 8) {
         scene.remove(box);
         bonusBoxesRef.current.splice(i, 1);
       } else if (
@@ -766,7 +884,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     // ── Collision — golden keys ──
     for (let i = goldenKeysRef.current.length - 1; i >= 0; i--) {
       const key = goldenKeysRef.current[i];
-      if (key.position.z > car.position.z + 8) {
+      if (key.position.z > 8) {
         scene.remove(key);
         goldenKeysRef.current.splice(i, 1);
       } else if (
@@ -779,9 +897,9 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       }
     }
 
-    // ── Gradual difficulty ──
-    gs.baseGameSpeed += 0.000012;
-    gs.obstacleSpawnRate = Math.min(0.03, gs.obstacleSpawnRate + 0.000003);
+    // ── Gradual difficulty (slower ramp) ──
+    gs.baseGameSpeed += 0.000004;
+    gs.obstacleSpawnRate = Math.min(0.02, gs.obstacleSpawnRate + 0.000001);
 
     renderer.render(scene, camera);
     animationIdRef.current = requestAnimationFrame(animate);
@@ -795,7 +913,6 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     spawnRoadEvent,
     showPopup,
     endGame,
-    speedBoostActive,
   ]);
 
   // ─────────────────────────────────────────────────────────
@@ -863,10 +980,6 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       // White dashed lane dividers
       const dashGeo = new THREE.PlaneGeometry(0.12, 2.5);
       for (let z = -SEG_LENGTH / 2 + 2; z < SEG_LENGTH / 2; z += 6) {
-        // Two lane divider lines between 3 lanes
-        [-(LANE_WIDTH / 2 + LANE_WIDTH / 6), LANE_WIDTH / 2 + LANE_WIDTH / 6].forEach(() => {
-          // Actually place at boundaries: -LANE_WIDTH/2 and +LANE_WIDTH/2
-        });
         [-LANE_WIDTH * 0.5, LANE_WIDTH * 0.5].forEach((x) => {
           const dash = new THREE.Mesh(dashGeo, mats.dash);
           dash.rotation.x = -Math.PI / 2;
@@ -890,7 +1003,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
 
     // === SCENE ===
     const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0xcceeff, 80, 350);
+    scene.fog = new THREE.Fog(0xcceeff, 150, 500);
     scene.background = new THREE.Color(0x88bbee);
     sceneRef.current = scene;
 
@@ -975,13 +1088,29 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       }),
       edgeLine: new THREE.MeshStandardMaterial({ color: 0xffcc00 }),
       dash: new THREE.MeshStandardMaterial({ color: 0xffffff }),
-      cone: new THREE.MeshStandardMaterial({ color: 0xff5500, roughness: 0.6 }),
-      barrier: new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.7 }),
-      barrierStripe: new THREE.MeshStandardMaterial({ color: 0xffffff }),
+      cone: new THREE.MeshStandardMaterial({
+        color: 0xff4400,
+        roughness: 0.5,
+        emissive: new THREE.Color(0xff2200),
+        emissiveIntensity: 0.3,
+      }),
+      barrier: new THREE.MeshStandardMaterial({
+        color: 0xff5500,
+        roughness: 0.6,
+        emissive: new THREE.Color(0xff3300),
+        emissiveIntensity: 0.3,
+      }),
+      barrierStripe: new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        emissive: new THREE.Color(0xffffff),
+        emissiveIntensity: 0.4,
+      }),
       stalledCar: new THREE.MeshStandardMaterial({
-        color: 0x444444,
+        color: 0x882222,
         roughness: 0.5,
         metalness: 0.4,
+        emissive: new THREE.Color(0x661111),
+        emissiveIntensity: 0.2,
       }),
       bonusBox: new THREE.MeshStandardMaterial({
         color: 0x22cc44,
@@ -1001,12 +1130,12 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     };
 
     const geos: Record<string, THREE.BufferGeometry> = {
-      cone: new THREE.ConeGeometry(0.25, 0.7, 8),
-      barrier: new THREE.BoxGeometry(1.2, 0.7, 0.3),
-      barrierStripe: new THREE.BoxGeometry(1.22, 0.1, 0.32),
-      stalledBody: new THREE.BoxGeometry(1.8, 0.5, 3.0),
-      stalledRoof: new THREE.BoxGeometry(1.4, 0.4, 1.3),
-      bonusBox: new THREE.BoxGeometry(0.9, 0.9, 0.9),
+      cone: new THREE.ConeGeometry(0.4, 1.2, 8),
+      barrier: new THREE.BoxGeometry(2.0, 1.2, 0.5),
+      barrierStripe: new THREE.BoxGeometry(2.02, 0.15, 0.52),
+      stalledBody: new THREE.BoxGeometry(2.0, 0.6, 3.2),
+      stalledRoof: new THREE.BoxGeometry(1.6, 0.5, 1.5),
+      bonusBox: new THREE.BoxGeometry(1.0, 1.0, 1.0),
       keyHandle: new THREE.TorusGeometry(0.5, 0.12, 8, 16),
       keyShaft: new THREE.BoxGeometry(0.18, 0.18, 1.2),
     };
@@ -1078,7 +1207,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
 
     // === CAR ===
     const carGroup = new THREE.Group();
-    const carColor = CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)];
+    const carColor = selectedCarColor ?? CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)];
 
     const paintMat = new THREE.MeshStandardMaterial({
       color: carColor,
@@ -1198,7 +1327,8 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     // === RESET GAME STATE ===
     carLaneRef.current = 1;
     carXRef.current = 0;
-    lastObstacleZRef.current = -50; // start spawning 50 units ahead
+    lastObstacleZRef.current = 50; // first obstacle after 50 units of distance
+    distanceTraveledRef.current = 0;
 
     gameStatsRef.current = {
       distance: 0,
@@ -1210,9 +1340,9 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     };
 
     gameStateRef.current = {
-      baseGameSpeed: 0.008,
-      speedMultiplier: 1.0,
-      obstacleSpawnRate: 0.01,
+      baseGameSpeed: 0.005,
+      speedMultiplier: 0.7,
+      obstacleSpawnRate: 0.008,
       nextBonusThreshold: 70,
       gameStartTime: Date.now(),
       nextKeySpawnTime: 20,
@@ -1220,16 +1350,23 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       isInvisible: false,
       invisibilityTimer: 0,
       currentScore: 0,
-      maxSpeed: 2.5,
+      maxSpeed: 1.6,
+      coinsCollected: 0,
+      lives: 3,
+      respawnInvincible: false,
+      respawnTimer: 0,
     };
 
     setScore(0);
-    setSpeed(1.0);
+    setSpeed(0.7);
+    setCoins(0);
+    setLives(3);
     setGameOver(false);
     setIsNewHighScore(false);
     setInvisibilityActive(false);
     setInvisibilityCountdown(0);
 
+    lastFrameTimeRef.current = 0;
     setGameRunning(true);
     gameRunningRef.current = true;
     setTimeout(() => animate(), 50);
@@ -1284,7 +1421,8 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       }
     };
     const handleMouseMove = (e: MouseEvent) => {
-      if (!gameRunningRef.current || !rendererRef.current) return;
+      // Only steer with mouse when left button is held down
+      if (!gameRunningRef.current || !rendererRef.current || !(e.buttons & 1)) return;
       const rect = rendererRef.current.domElement.getBoundingClientRect();
       const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1; // -1 to 1
 
@@ -1395,10 +1533,13 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
     gameRunningRef.current = false;
     setGameOver(false);
     setScore(0);
-    setSpeed(1.0);
+    setSpeed(0.7);
+    setCoins(0);
+    setLives(3);
     setIsNewHighScore(false);
     setPopup(null);
     setSpeedBoostActive(false);
+    speedBoostActiveRef.current = false;
     setTimeout(() => initializeGame(), 100);
   };
 
@@ -1434,7 +1575,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
       {/* HUD */}
       {gameRunning && (
         <>
-          {/* Score */}
+          {/* Score + Coins */}
           <div
             style={{
               position: "absolute",
@@ -1459,6 +1600,31 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
                 pts
               </span>
             </div>
+            <div style={{ fontSize: 16, fontWeight: "bold", color: "#ffd700", marginTop: 4, display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ fontSize: 18 }}>&#9679;</span>
+              {coins}
+            </div>
+          </div>
+
+          {/* Lives */}
+          <div
+            style={{
+              position: "absolute",
+              top: 60,
+              right: 16,
+              background: "rgba(0,0,0,0.55)",
+              borderRadius: 10,
+              padding: "5px 14px",
+              color: "#ff4444",
+              fontSize: 20,
+              fontWeight: "bold",
+              display: "flex",
+              gap: 4,
+            }}
+          >
+            {Array.from({ length: lives }).map((_, i) => (
+              <span key={i}>&#9829;</span>
+            ))}
           </div>
 
           {/* Speed */}
@@ -1587,7 +1753,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
                   height: 12,
                   borderRadius: "50%",
                   background:
-                    carLaneRef.current === l
+                    currentLane === l
                       ? "rgba(255,255,255,0.8)"
                       : "rgba(255,255,255,0.2)",
                   transition: "background 0.15s",
@@ -1732,6 +1898,16 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username }) =
               }}
             >
               Best: {highScore} pts
+            </div>
+            <div
+              style={{
+                fontSize: 14,
+                color: "#ffd700",
+                fontWeight: "bold",
+                marginBottom: 8,
+              }}
+            >
+              &#9679; {gameStateRef.current.coinsCollected} coins collected
             </div>
             <div
               style={{
