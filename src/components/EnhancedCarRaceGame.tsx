@@ -913,23 +913,31 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
   ]);
 
   // ── Pause / Resume ──
+  // Use a ref so event listeners always call the latest version
+  const togglePauseRef = useRef<() => void>(() => {});
   const togglePause = useCallback(() => {
-    if (!gameRunningRef.current && !pausedRef.current) return;
-    if (gameOver) return;
+    togglePauseRef.current();
+  }, []);
+  // Keep the ref implementation up to date
+  useEffect(() => {
+    togglePauseRef.current = () => {
+      if (!gameRunningRef.current && !pausedRef.current) return;
+      if (gameOver) return;
 
-    if (!pausedRef.current) {
-      pausedRef.current = true;
-      setPaused(true);
-      cancelAnimationFrame(animationIdRef.current);
-      animationIdRef.current = 0;
-      gameRunningRef.current = false;
-    } else {
-      pausedRef.current = false;
-      setPaused(false);
-      lastFrameTimeRef.current = 0;
-      gameRunningRef.current = true;
-      animate();
-    }
+      if (!pausedRef.current) {
+        pausedRef.current = true;
+        setPaused(true);
+        cancelAnimationFrame(animationIdRef.current);
+        animationIdRef.current = 0;
+        gameRunningRef.current = false;
+      } else {
+        pausedRef.current = false;
+        setPaused(false);
+        lastFrameTimeRef.current = 0;
+        gameRunningRef.current = true;
+        animate();
+      }
+    };
   }, [gameOver, animate]);
 
   // ─────────────────────────────────────────────────────────
@@ -1458,13 +1466,30 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
     };
 
     // ── Swipe gesture detection (full-screen) ──
+    const isInteractiveElement = (el: EventTarget | null): boolean => {
+      if (!el || !(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      if (tag === "BUTTON" || tag === "A" || tag === "INPUT") return true;
+      if (el.getAttribute("data-clickable") === "true") return true;
+      // Check parents up to 4 levels
+      let parent = el.parentElement;
+      for (let i = 0; i < 4 && parent; i++) {
+        if (parent.tagName === "BUTTON" || parent.getAttribute("data-clickable") === "true") return true;
+        parent = parent.parentElement;
+      }
+      return false;
+    };
+
     const handleTouchStart = (e: TouchEvent) => {
+      // Let buttons/interactive elements handle their own events
+      if (isInteractiveElement(e.target)) return;
       if (!gameRunningRef.current && !pausedRef.current) return;
       e.preventDefault();
       const touch = e.changedTouches[0];
       touchStartRef.current = { x: touch.clientX, y: touch.clientY, id: touch.identifier };
     };
     const handleTouchEnd = (e: TouchEvent) => {
+      if (isInteractiveElement(e.target)) return;
       if (!touchStartRef.current) return;
       e.preventDefault();
       const touch = Array.from(e.changedTouches).find(
@@ -1502,6 +1527,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
       }
     };
     const handleTouchMove = (e: TouchEvent) => {
+      if (isInteractiveElement(e.target)) return;
       if (touchStartRef.current) e.preventDefault();
     };
 
@@ -1526,6 +1552,8 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
 
   // ── Effects ──
   useEffect(() => {
+    // Don't interfere when paused — pause manages gameRunningRef itself
+    if (pausedRef.current) return;
     if (gameRunning && !animationIdRef.current) {
       gameRunningRef.current = true;
       gameStatsRef.current.gameStartTime = Date.now();
@@ -1798,7 +1826,9 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
 
           {/* Pause button */}
           <div
+            data-clickable="true"
             onClick={togglePause}
+            onTouchEnd={(e) => { e.preventDefault(); togglePause(); }}
             style={{
               position: "absolute",
               top: 100,
@@ -1812,6 +1842,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
               cursor: "pointer",
               userSelect: "none",
               letterSpacing: 2,
+              touchAction: "none",
             }}
           >
             &#9646;&#9646;
@@ -1880,6 +1911,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
             </div>
             <button
               onClick={togglePause}
+              onTouchEnd={(e) => { e.preventDefault(); togglePause(); }}
               style={{
                 width: "100%",
                 padding: 14,
@@ -1891,12 +1923,14 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
                 fontWeight: "bold",
                 cursor: "pointer",
                 marginBottom: 10,
+                touchAction: "none",
               }}
             >
               Resume
             </button>
             <button
               onClick={handleRestart}
+              onTouchEnd={(e) => { e.preventDefault(); handleRestart(); }}
               style={{
                 width: "100%",
                 padding: 14,
@@ -1907,6 +1941,7 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
                 fontSize: 18,
                 fontWeight: "bold",
                 cursor: "pointer",
+                touchAction: "none",
               }}
             >
               Restart
