@@ -131,7 +131,6 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
   const [speed, setSpeed] = useState(1.0);
   const [highScore, setHighScore] = useState(0);
   const [isNewHighScore, setIsNewHighScore] = useState(false);
-  const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const [invisibilityActive, setInvisibilityActive] = useState(false);
   const [invisibilityCountdown, setInvisibilityCountdown] = useState(0);
   const [popup, setPopup] = useState<string | null>(null);
@@ -140,6 +139,9 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
   const [coins, setCoins] = useState(0);
   const [lives, setLives] = useState(3);
   const [currentLane, setCurrentLane] = useState(1);
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(false);
+  const touchStartRef = useRef<{ x: number; y: number; id: number } | null>(null);
 
   // ── Load high score ──
   useEffect(() => {
@@ -147,11 +149,6 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
     if (saved) setHighScore(parseInt(saved));
   }, []);
 
-  useEffect(() => {
-    const h = () => setIsMobile(window.innerWidth <= 768);
-    window.addEventListener("resize", h);
-    return () => window.removeEventListener("resize", h);
-  }, []);
 
   // ── Helpers ──
   const showPopup = useCallback((text: string) => {
@@ -915,6 +912,26 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
     endGame,
   ]);
 
+  // ── Pause / Resume ──
+  const togglePause = useCallback(() => {
+    if (!gameRunningRef.current && !pausedRef.current) return;
+    if (gameOver) return;
+
+    if (!pausedRef.current) {
+      pausedRef.current = true;
+      setPaused(true);
+      cancelAnimationFrame(animationIdRef.current);
+      animationIdRef.current = 0;
+      gameRunningRef.current = false;
+    } else {
+      pausedRef.current = false;
+      setPaused(false);
+      lastFrameTimeRef.current = 0;
+      gameRunningRef.current = true;
+      animate();
+    }
+  }, [gameOver, animate]);
+
   // ─────────────────────────────────────────────────────────
   // BUILD A SINGLE ROAD SEGMENT (reusable)
   // ─────────────────────────────────────────────────────────
@@ -1377,12 +1394,16 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
   // ─────────────────────────────────────────────────────────
   const setupControls = useCallback(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Pause toggle works even when game is paused
+      if (e.code === "Escape" || e.code === "KeyP") {
+        togglePause();
+        return;
+      }
       if (!gameRunningRef.current) return;
       switch (e.code) {
         case "KeyA":
         case "ArrowLeft":
           keysRef.current.left = true;
-          // Discrete lane switch
           carLaneRef.current = Math.max(0, carLaneRef.current - 1);
           break;
         case "KeyD":
@@ -1421,12 +1442,9 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
       }
     };
     const handleMouseMove = (e: MouseEvent) => {
-      // Only steer with mouse when left button is held down
       if (!gameRunningRef.current || !rendererRef.current || !(e.buttons & 1)) return;
       const rect = rendererRef.current.domElement.getBoundingClientRect();
-      const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1; // -1 to 1
-
-      // Map mouse x to lane
+      const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       if (mx < -0.25) carLaneRef.current = 0;
       else if (mx > 0.25) carLaneRef.current = 2;
       else carLaneRef.current = 1;
@@ -1439,18 +1457,72 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
       }
     };
 
+    // ── Swipe gesture detection (full-screen) ──
+    const handleTouchStart = (e: TouchEvent) => {
+      if (!gameRunningRef.current && !pausedRef.current) return;
+      e.preventDefault();
+      const touch = e.changedTouches[0];
+      touchStartRef.current = { x: touch.clientX, y: touch.clientY, id: touch.identifier };
+    };
+    const handleTouchEnd = (e: TouchEvent) => {
+      if (!touchStartRef.current) return;
+      e.preventDefault();
+      const touch = Array.from(e.changedTouches).find(
+        (t) => t.identifier === touchStartRef.current!.id
+      );
+      if (!touch) return;
+
+      const dx = touch.clientX - touchStartRef.current.x;
+      const dy = touch.clientY - touchStartRef.current.y;
+      touchStartRef.current = null;
+
+      const MIN_SWIPE = 30;
+      if (Math.abs(dx) < MIN_SWIPE && Math.abs(dy) < MIN_SWIPE) return;
+
+      if (!gameRunningRef.current) return; // ignore swipes while paused/game over
+
+      if (Math.abs(dx) > Math.abs(dy)) {
+        // Horizontal swipe — lane change
+        if (dx > 0) {
+          carLaneRef.current = Math.min(LANE_COUNT - 1, carLaneRef.current + 1);
+        } else {
+          carLaneRef.current = Math.max(0, carLaneRef.current - 1);
+        }
+      } else {
+        // Vertical swipe — speed
+        if (dy < 0) {
+          // Swipe up → speed up
+          keysRef.current.up = true;
+          setTimeout(() => { keysRef.current.up = false; }, 200);
+        } else {
+          // Swipe down → slow down
+          keysRef.current.down = true;
+          setTimeout(() => { keysRef.current.down = false; }, 200);
+        }
+      }
+    };
+    const handleTouchMove = (e: TouchEvent) => {
+      if (touchStartRef.current) e.preventDefault();
+    };
+
     document.addEventListener("keydown", handleKeyDown);
     document.addEventListener("keyup", handleKeyUp);
     document.addEventListener("mousemove", handleMouseMove);
     window.addEventListener("resize", handleResize);
+    document.addEventListener("touchstart", handleTouchStart, { passive: false });
+    document.addEventListener("touchend", handleTouchEnd, { passive: false });
+    document.addEventListener("touchmove", handleTouchMove, { passive: false });
 
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener("keyup", handleKeyUp);
       document.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("resize", handleResize);
+      document.removeEventListener("touchstart", handleTouchStart);
+      document.removeEventListener("touchend", handleTouchEnd);
+      document.removeEventListener("touchmove", handleTouchMove);
     };
-  }, []);
+  }, [togglePause]);
 
   // ── Effects ──
   useEffect(() => {
@@ -1532,6 +1604,8 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
     setGameRunning(false);
     gameRunningRef.current = false;
     setGameOver(false);
+    setPaused(false);
+    pausedRef.current = false;
     setScore(0);
     setSpeed(0.7);
     setCoins(0);
@@ -1541,18 +1615,6 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
     setSpeedBoostActive(false);
     speedBoostActiveRef.current = false;
     setTimeout(() => initializeGame(), 100);
-  };
-
-  // ── Mobile touch — lane switch ──
-  const handleTouchLeft = () => {
-    if (gameRunningRef.current) {
-      carLaneRef.current = Math.max(0, carLaneRef.current - 1);
-    }
-  };
-  const handleTouchRight = () => {
-    if (gameRunningRef.current) {
-      carLaneRef.current = Math.min(LANE_COUNT - 1, carLaneRef.current + 1);
-    }
   };
 
   // ─────────────────────────────────────────────────────────
@@ -1734,11 +1796,32 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
             </div>
           )}
 
+          {/* Pause button */}
+          <div
+            onClick={togglePause}
+            style={{
+              position: "absolute",
+              top: 100,
+              right: 16,
+              background: "rgba(0,0,0,0.55)",
+              borderRadius: 10,
+              padding: "6px 12px",
+              color: "#fff",
+              fontSize: 20,
+              fontWeight: "bold",
+              cursor: "pointer",
+              userSelect: "none",
+              letterSpacing: 2,
+            }}
+          >
+            &#9646;&#9646;
+          </div>
+
           {/* Lane indicators (subtle) */}
           <div
             style={{
               position: "absolute",
-              bottom: isMobile ? 160 : 20,
+              bottom: 20,
               left: "50%",
               transform: "translateX(-50%)",
               display: "flex",
@@ -1761,79 +1844,75 @@ const EnhancedCarRaceGame: React.FC<EnhancedCarRaceGameProps> = ({ username, sel
               />
             ))}
           </div>
-
-          {/* Mobile touch zones */}
-          {isMobile && (
-            <>
-              <div
-                onTouchStart={(e) => {
-                  e.preventDefault();
-                  handleTouchLeft();
-                }}
-                style={{
-                  position: "absolute",
-                  bottom: 0,
-                  left: 0,
-                  width: "50%",
-                  height: "35%",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  touchAction: "none",
-                }}
-              >
-                <div
-                  style={{
-                    background: "rgba(255,255,255,0.12)",
-                    borderRadius: "50%",
-                    width: 70,
-                    height: 70,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: 28,
-                    color: "rgba(255,255,255,0.5)",
-                  }}
-                >
-                  &#9664;
-                </div>
-              </div>
-              <div
-                onTouchStart={(e) => {
-                  e.preventDefault();
-                  handleTouchRight();
-                }}
-                style={{
-                  position: "absolute",
-                  bottom: 0,
-                  right: 0,
-                  width: "50%",
-                  height: "35%",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  touchAction: "none",
-                }}
-              >
-                <div
-                  style={{
-                    background: "rgba(255,255,255,0.12)",
-                    borderRadius: "50%",
-                    width: 70,
-                    height: 70,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: 28,
-                    color: "rgba(255,255,255,0.5)",
-                  }}
-                >
-                  &#9654;
-                </div>
-              </div>
-            </>
-          )}
         </>
+      )}
+
+      {/* Pause Overlay */}
+      {paused && !gameOver && (
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: "100%",
+            height: "100%",
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 10,
+          }}
+        >
+          <div
+            style={{
+              background: "rgba(10,10,20,0.92)",
+              borderRadius: 20,
+              padding: "36px 40px",
+              textAlign: "center",
+              color: "#fff",
+              maxWidth: 340,
+              width: "90%",
+            }}
+          >
+            <h2 style={{ fontSize: 34, marginBottom: 8 }}>PAUSED</h2>
+            <div style={{ fontSize: 18, opacity: 0.6, marginBottom: 24 }}>
+              Score: {score}
+            </div>
+            <button
+              onClick={togglePause}
+              style={{
+                width: "100%",
+                padding: 14,
+                borderRadius: 12,
+                border: "none",
+                background: "#22cc88",
+                color: "#111",
+                fontSize: 18,
+                fontWeight: "bold",
+                cursor: "pointer",
+                marginBottom: 10,
+              }}
+            >
+              Resume
+            </button>
+            <button
+              onClick={handleRestart}
+              style={{
+                width: "100%",
+                padding: 14,
+                borderRadius: 12,
+                border: "2px solid rgba(255,255,255,0.3)",
+                background: "transparent",
+                color: "#fff",
+                fontSize: 18,
+                fontWeight: "bold",
+                cursor: "pointer",
+              }}
+            >
+              Restart
+            </button>
+          </div>
+        </div>
       )}
 
       {/* Game Over */}
